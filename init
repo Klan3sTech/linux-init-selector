@@ -1,0 +1,500 @@
+#!/bin/sh
+#
+# init - The PID 1 script for init-selector.
+# This script runs as PID 1 inside the initramfs (early userspace).
+# Responsibilities:
+# - Mount essential filesystems (proc, sys, dev, run)
+# - Parse kernel command line for initsel= parameter
+# - Mount real root filesystem (assumed /dev/root or from root= parameter)
+# - Load previous selection from /etc/init-selector/last (if present)
+# - Show interactive menu if no kernel param and timeout allows
+# - Perform switch_root to real root and exec the chosen init
+#
+# POSIX sh only. Uses only BusyBox-compatible utilities (assumed present).
+# No Bashisms. No Python/Perl.
+# Must handle errors gracefully as described.
+#
+
+# --- Configuration variables ---
+# Paths inside initramfs (will be relative until switch)
+INITRAMFS_ROOT=/
+REAL_ROOT_MOUNT=/mnt/root
+CONFIG_DIR=/etc/init-selector
+CONFIG_FILE=${CONFIG_DIR}/config
+LAST_FILE=${CONFIG_DIR}/last
+TIMEOUT=5
+
+# Supported init names (hardcoded for safety)
+SUPPORTED="systemd openrc runit dinit"
+
+# --- Helper functions with comments ---
+
+# log - Print message to console (PID1 has no logger yet).
+log() {
+    echo "init-selector: $*" >&2
+}
+
+# fatal - Log error and drop to rescue shell or panic.
+# Since we are PID1, we cannot easily exit; try to offer shell if possible.
+fatal() {
+    log "FATAL: $*"
+    # Attempt to provide rescue shell on /dev/console
+    if [ -c /dev/console ]; then
+        log "Dropping to rescue shell. Type 'exit' to attempt reboot."
+        exec sh -i < /dev/console > /dev/console 2>&1
+    else
+        # Last resort: infinite sleep (kernel will panic eventually)
+        log "No console. Sleeping forever."
+        while true; do sleep 3600; done
+    fi
+}
+
+# mount_essentials - Mount /proc, /sys, /dev, /run required early.
+# Use -n to avoid /etc/mtab pollution in initramfs.
+mount_essentials() {
+    # devtmpfs for /dev (kernel populates devices)
+    if ! mount -t devtmpfs -o mode=0755 devtmpfs /dev 2>/dev/null; then
+        # Fallback if devtmpfs fails
+        mount -t tmpfs -o mode=0755 tmpfs /dev || true
+    fi
+
+    # procfs
+    mount -t proc -o nodev,noexec,nosuid proc /proc || true
+
+    # sysfs
+    mount -t sysfs -o nodev,noexec,nosuid sysfs /sys || true
+
+    # tmpfs for /run (PID1 state, udev etc.)
+    mount -t tmpfs -o mode=0755 tmpfs /run || true
+
+    # Create common subdirs
+    mkdir -p /dev/pts /dev/shm /run/initramfs /run/lock || true
+}
+
+# parse_cmdline - Read kernel command line and extract key parameters.
+# Sets global variables:
+#   ROOT=...
+#   INITS_EL=...
+#   INITS_EL is the forced init name from initsel=
+parse_cmdline() {
+    ROOT=""
+    INITS_EL=""
+    # Read /proc/cmdline if mounted, else fallback
+    if [ -r /proc/cmdline ]; then
+        CMDLINE=$(cat /proc/cmdline)
+    else
+        CMDLINE=""
+    fi
+
+    for param in $CMDLINE; do
+        case "$param" in
+            root=*)
+                ROOT=${param#root=}
+                ;;
+            initsel=*)
+                INITS_EL=${param#initsel=}
+                ;;
+            # Also support init=/... but we ignore for selector
+        esac
+    done
+
+    # Default root if not provided (rare, but fallback)
+    if [ -z "$ROOT" ]; then
+        # Common fallback for many setups
+        ROOT="/dev/root"
+    fi
+}
+
+# mount_root - Mount the real root filesystem read-write.
+# Uses the value from ROOT= (or default).
+# Creates mountpoint and mounts.
+# On failure, calls fatal.
+mount_root() {
+    mkdir -p "$REAL_ROOT_MOUNT" || fatal "Cannot create mountpoint $REAL_ROOT_MOUNT"
+
+    # Try to mount. First assume block device.
+    # Support common formats: /dev/sdX, UUID=, LABEL=
+    mount_dev="$ROOT"
+
+    # Handle UUID= and LABEL= (busybox mount supports)
+    log "Mounting root filesystem: $mount_dev"
+
+    # Mount with common options. rw is default.
+    if ! mount -o rw "$mount_dev" "$REAL_ROOT_MOUNT" 2>/dev/null; then
+        # Try ro first then remount rw (sometimes required)
+        if mount -o ro "$mount_dev" "$REAL_ROOT_MOUNT" 2>/dev/null; then
+            mount -o remount,rw "$REAL_ROOT_MOUNT" || \
+                fatal "Failed to remount root rw: $mount_dev"
+        else
+            # Last attempt: try without -o rw explicit
+            mount "$mount_dev" "$REAL_ROOT_MOUNT" || \
+                fatal "Cannot mount root filesystem '$ROOT' (tried $mount_dev)"
+        fi
+    fi
+
+    # Verify we mounted something sensible
+    if [ ! -d "$REAL_ROOT_MOUNT"/etc ]; then
+        fatal "Mounted root does not look like a Linux root (no /etc)"
+    fi
+
+    log "Root mounted successfully at $REAL_ROOT_MOUNT"
+}
+
+# load_config - Load init list from real root's config.
+# Expects $REAL_ROOT_MOUNT$CONFIG_FILE
+# Populates global variables:
+#   INITS_LIST="name1:path1 name2:path2 ..."
+#   DEFAULT_INIT=...
+load_config() {
+    INITS_LIST=""
+    DEFAULT_INIT=""
+
+    cfg_path="${REAL_ROOT_MOUNT}${CONFIG_FILE}"
+
+    if [ -f "$cfg_path" ]; then
+        # Read line by line (POSIX)
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Skip comments and empty lines
+            case "$line" in
+                \#* | "") continue ;;
+            esac
+            # Parse DEFAULT= or name path
+            if [ "${line%%=*}" = "DEFAULT" ]; then
+                DEFAULT_INIT=${line#DEFAULT=}
+            else
+                # name path
+                name=${line%% *}
+                path=${line#* }
+                # Validate name
+                case " $SUPPORTED " in
+                    *" $name "*) ;;
+                    *) continue ;;
+                esac
+                if [ -z "$INITS_LIST" ]; then
+                    INITS_LIST="${name}:${path}"
+                else
+                    INITS_LIST="${INITS_LIST} ${name}:${path}"
+                fi
+            fi
+        done < "$cfg_path"
+    fi
+
+    # If no config found, use minimal hardcoded fallback
+    if [ -z "$INITS_LIST" ]; then
+        log "No config found on root, using fallback detection"
+        # Fallback: try to detect common locations on real root
+        for pair in \
+            "systemd:/usr/lib/systemd/systemd" \
+            "systemd:/lib/systemd/systemd" \
+            "openrc:/sbin/openrc-init" \
+            "runit:/sbin/runit-init" \
+            "dinit:/sbin/dinit"; do
+            name=${pair%%:*}
+            p=${pair#*:}
+            if [ -x "${REAL_ROOT_MOUNT}${p}" ]; then
+                if [ -z "$INITS_LIST" ]; then
+                    INITS_LIST="${name}:${p}"
+                else
+                    INITS_LIST="${INITS_LIST} ${name}:${p}"
+                fi
+            fi
+        done
+    fi
+
+    # Set default if not present
+    if [ -z "$DEFAULT_INIT" ]; then
+        # Use first in list or hardcoded
+        if [ -n "$INITS_LIST" ]; then
+            DEFAULT_INIT=${INITS_LIST%%:*}
+        else
+            DEFAULT_INIT="systemd"
+        fi
+    fi
+}
+
+# load_last_selection - Load previously chosen init from ${REAL_ROOT_MOUNT}${LAST_FILE}
+# If present and valid, override DEFAULT_INIT with it.
+load_last_selection() {
+    last_path="${REAL_ROOT_MOUNT}${LAST_FILE}"
+    if [ -f "$last_path" ]; then
+        last=$(cat "$last_path" 2>/dev/null | tr -d ' \t\r\n')
+        if [ -n "$last" ]; then
+            # Check if this last is still valid in current list
+            valid=0
+            for entry in $INITS_LIST; do
+                n=${entry%%:*}
+                if [ "$n" = "$last" ]; then
+                    valid=1
+                    break
+                fi
+            done
+            if [ "$valid" -eq 1 ]; then
+                DEFAULT_INIT="$last"
+                log "Using last selected init as default: $last"
+            fi
+        fi
+    fi
+}
+
+# save_last_selection - After selection, save chosen name to real root last file.
+save_last_selection() {
+    chosen="$1"
+    last_path="${REAL_ROOT_MOUNT}${LAST_FILE}"
+    # Ensure dir exists (already mounted)
+    mkdir -p "$(dirname "$last_path")" 2>/dev/null || true
+    echo "$chosen" > "$last_path" || log "Warning: could not save last selection"
+}
+
+# get_init_path - Return full path on real root for a given name.
+# Uses $INITS_LIST
+get_init_path() {
+    name="$1"
+    for entry in $INITS_LIST; do
+        n=${entry%%:*}
+        p=${entry#*:}
+        if [ "$n" = "$name" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# validate_init - Check if selected name is supported and path exists on real root.
+validate_init() {
+    name="$1"
+    case " $SUPPORTED " in
+        *" $name "*) ;;
+        *) return 1 ;;
+    esac
+
+    path=$(get_init_path "$name")
+    if [ -z "$path" ]; then
+        return 1
+    fi
+
+    full="${REAL_ROOT_MOUNT}${path}"
+    if [ ! -x "$full" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# show_menu - Display text menu of available inits and read user choice.
+# Uses read with -t for timeout.
+# Returns chosen name (empty on timeout)
+show_menu() {
+    # If no inits, error
+    if [ -z "$INITS_LIST" ]; then
+        fatal "No init systems detected in configuration"
+    fi
+
+    echo ""
+    echo "========================================"
+    echo "  init-selector: Choose init system"
+    echo "========================================"
+    echo ""
+    echo "Available init systems:"
+    i=1
+    for entry in $INITS_LIST; do
+        n=${entry%%:*}
+        p=${entry#*:}
+        marker=""
+        if [ "$n" = "$DEFAULT_INIT" ]; then
+            marker=" (default)"
+        fi
+        echo "  $i) $n - $p$marker"
+        eval "MENU_$i=$n"
+        i=$((i + 1))
+    done
+    echo ""
+    echo "Enter number (or name) or wait ${TIMEOUT}s for default ($DEFAULT_INIT):"
+    echo -n "> "
+
+    # Read with timeout using read -t (POSIX sh compliant in BusyBox/ash)
+    choice=""
+    if read -t "$TIMEOUT" choice < /dev/console 2>/dev/null || \
+       read -t "$TIMEOUT" choice; then
+        # success
+        :
+    else
+        # timeout
+        choice=""
+    fi
+
+    echo ""
+
+    # Normalize choice
+    choice=$(echo "$choice" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
+
+    if [ -z "$choice" ]; then
+        echo "$DEFAULT_INIT"
+        return 0
+    fi
+
+    # If numeric
+    case "$choice" in
+        [0-9]*)
+            num=$choice
+            if [ "$num" -ge 1 ] 2>/dev/null; then
+                eval "sel=\${MENU_$num}"
+                if [ -n "$sel" ]; then
+                    echo "$sel"
+                    return 0
+                fi
+            fi
+            ;;
+    esac
+
+    # Try as direct name
+    for entry in $INITS_LIST; do
+        n=${entry%%:*}
+        if [ "$n" = "$choice" ]; then
+            echo "$n"
+            return 0
+        fi
+    done
+
+    # Invalid -> default
+    log "Invalid choice '$choice', using default"
+    echo "$DEFAULT_INIT"
+}
+
+# perform_switch_root - Do the switch.
+# cd to newroot, exec switch_root . /path/to/init
+# Must be last thing executed.
+perform_switch_root() {
+    name="$1"
+    init_path=$(get_init_path "$name")
+    if [ -z "$init_path" ]; then
+        fatal "Internal error: no path for $name"
+    fi
+
+    full_init="${REAL_ROOT_MOUNT}${init_path}"
+
+    # Final validation
+    if [ ! -x "$full_init" ]; then
+        fatal "Selected init '$name' not found or not executable at $full_init"
+    fi
+
+    # Save selection (before switch)
+    save_last_selection "$name"
+
+    log "Switching root to $REAL_ROOT_MOUNT, executing $init_path as PID 1"
+
+    # Unmount early filesystems that might interfere (optional but recommended)
+    # We do not unmount /dev /proc etc fully, switch_root handles cleanup.
+    # But clean up tmp mounts if needed.
+    umount /run 2>/dev/null || true
+    umount /sys 2>/dev/null || true
+    umount /proc 2>/dev/null || true
+
+    # IMPORTANT: cd to new root
+    cd "$REAL_ROOT_MOUNT" || fatal "Cannot cd to new root"
+
+    # switch_root syntax for BusyBox:
+    # switch_root NEW_ROOT NEW_INIT [ARGS...]
+    # It will:
+    #  - chroot to NEW_ROOT
+    #  - delete contents of old root (initramfs)
+    #  - move NEW_ROOT to /
+    #  - exec NEW_INIT
+    #
+    # We pass the full relative path from new root perspective.
+    exec switch_root . "$init_path" "$@" || \
+        fatal "switch_root failed for $init_path"
+}
+
+# handle_kernel_param - If initsel= was set in cmdline, use it directly.
+# Validates and returns the name or falls back.
+handle_kernel_param() {
+    if [ -z "$INITS_EL" ]; then
+        return 1  # no param
+    fi
+
+    # Normalize
+    sel=$(echo "$INITS_EL" | tr '[:upper:]' '[:lower:]')
+
+    # Map common aliases
+    case "$sel" in
+        systemd|systemd) sel="systemd" ;;
+        openrc|openrc)   sel="openrc" ;;
+        runit|runit)     sel="runit" ;;
+        dinit|dinit)     sel="dinit" ;;
+        *)
+            log "Invalid initsel='$INITS_EL' (must be one of: $SUPPORTED)"
+            return 1
+            ;;
+    esac
+
+    if validate_init "$sel"; then
+        log "Kernel parameter initsel=$sel forced, skipping menu"
+        echo "$sel"
+        return 0
+    else
+        log "initsel=$sel requested but not found or invalid. Falling back to menu/default."
+        return 1
+    fi
+}
+
+# --- Main execution ---
+
+main() {
+    log "init-selector starting as PID 1"
+
+    # 1. Mount essentials
+    mount_essentials
+
+    # 2. Parse kernel cmdline
+    parse_cmdline
+
+    # 3. Mount real root
+    mount_root
+
+    # 4. Load config and last selection
+    load_config
+    load_last_selection
+
+    # 5. Determine selected init
+    selected=""
+
+    # Priority 1: kernel parameter
+    if selected=$(handle_kernel_param); then
+        : # selected set
+    else
+        # Priority 2: interactive menu (or timeout)
+        selected=$(show_menu)
+    fi
+
+    # Validate final selection
+    if ! validate_init "$selected"; then
+        log "Selected init '$selected' invalid after menu."
+        # Try default one more time
+        selected="$DEFAULT_INIT"
+        if ! validate_init "$selected"; then
+            # Last resort: find first valid
+            for entry in $INITS_LIST; do
+                n=${entry%%:*}
+                if validate_init "$n"; then
+                    selected="$n"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    if ! validate_init "$selected"; then
+        fatal "No valid init system could be selected. Check $CONFIG_FILE"
+    fi
+
+    log "Selected init: $selected"
+
+    # 6. Perform the switch
+    perform_switch_root "$selected"
+}
+
+# Execute main
+main
+
+# If we reach here, exec failed badly
+fatal "Reached end of init script unexpectedly"
