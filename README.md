@@ -1,131 +1,132 @@
 # init-selector
 
-A POSIX-compliant early-boot init selector for Linux. It allows you to choose between multiple init systems (systemd, OpenRC, runit, dinit) **before** PID 1 is started on the real root filesystem.
+POSIX-совместимый селектор init-системы на ранней стадии загрузки Linux. Позволяет выбрать одну из нескольких init-систем (systemd, OpenRC, runit, dinit) **до** запуска PID 1 на реальной корневой файловой системе.
 
-This project is inspired by the early-stage selection mechanism used in Bedrock Linux, but is designed to be minimal, portable, and non-invasive.
+Проект вдохновлён механизмом раннего выбора, используемым в Bedrock Linux, но спроектирован как минималистичный, переносимый и неинвазивный инструмент.
 
-**Key properties:**
-- Runs entirely in initramfs as PID 1
-- Uses only POSIX `sh` + BusyBox standard utilities
-- Does **not** replace your kernel or modify existing init systems
-- Works with dracut, mkinitcpio, and initramfs-tools (`update-initramfs`)
-
----
-
-## How Early Linux Boot Works
-
-1. **Bootloader** (GRUB, systemd-boot, etc.) loads the kernel image + initramfs into memory.
-2. **Kernel** initializes hardware, decompresses itself, and starts the initramfs as its initial root filesystem (`/`).
-3. The kernel looks for and executes `/init` inside the initramfs. **This `/init` becomes PID 1**.
-4. The initramfs `/init` is responsible for:
-   - Mounting essential virtual filesystems (`/proc`, `/sys`, `/dev`)
-   - Loading kernel modules if needed
-   - Discovering and mounting the real root filesystem (from `root=` kernel parameter)
-   - Switching from the temporary initramfs to the real root using `switch_root`
-5. After `switch_root`, the real root's `/sbin/init` (or equivalent) becomes the new PID 1.
-
-**Important:** The initramfs init script **is** PID 1 until `switch_root` is called. After the switch, the original initramfs contents are discarded from memory.
+**Ключевые особенности:**
+- Полностью работает в initramfs как процесс PID 1
+- Использует только POSIX `sh` и стандартные утилиты BusyBox
+- **Не** заменяет ядро и не модифицирует существующие init-системы
+- Работает с dracut, mkinitcpio и initramfs-tools (`update-initramfs`)
 
 ---
 
-## Why Init Must Be PID 1
+## Как работает ранняя загрузка Linux
 
-- The Linux kernel treats PID 1 specially:
-  - It is the ancestor of all other processes.
-  - It reaps zombie processes (orphaned children).
-  - It receives special signals (`SIGINT`, `SIGTERM`, `SIGPWR` etc.) for shutdown/reboot.
-  - Many daemons and the kernel itself expect PID 1 to be the "init" process.
-- If your chosen init is not executed as PID 1, services will not start correctly, and the system may become unusable or hang on shutdown.
-- `switch_root` (BusyBox) or `pivot_root` + `exec` is the **only** correct way to hand over control to a real root's init while preserving PID 1 semantics.
+1. **Загрузчик** (GRUB, systemd-boot и др.) загружает образ ядра и initramfs в память.
+2. **Ядро** инициализирует оборудование, распаковывает себя и монтирует initramfs как начальную корневую файловую систему (`/`).
+3. Ядро ищет и запускает `/init` внутри initramfs. **Этот `/init` становится процессом PID 1**.
+4. Скрипт initramfs `/init` отвечает за:
+   - Монтирование основных виртуальных файловых систем (`/proc`, `/sys`, `/dev`)
+   - Загрузку модулей ядра при необходимости
+   - Обнаружение и монтирование реальной корневой файловой системы (из параметра ядра `root=`)
+   - Переключение с временной initramfs на реальную корневую систему с помощью `switch_root`
+5. После `switch_root` init-система реальной корневой системы (обычно `/sbin/init`) становится новым PID 1.
+
+**Важно:** Скрипт initramfs является PID 1 до момента вызова `switch_root`. После переключения содержимое initramfs удаляется из памяти.
 
 ---
 
-## How `switch_root` Works
+## Почему init должен быть PID 1
 
-BusyBox `switch_root` performs the following atomically (from the point of view of the new root):
+- Ядро Linux особым образом обрабатывает процесс с PID 1:
+  - Он является предком всех остальных процессов в системе.
+  - Он «подбирает» зомби-процессы (осиротевшие дочерние процессы).
+  - Получает специальные сигналы (`SIGINT`, `SIGTERM`, `SIGPWR` и др.) для корректного завершения работы и перезагрузки.
+  - Многие демоны и само ядро ожидают, что PID 1 будет именно процессом init.
+- Если выбранная init-система не будет запущена как PID 1, сервисы не запустятся правильно, и система может стать неработоспособной или зависнуть при выключении.
+- `switch_root` (BusyBox) или `pivot_root` + `exec` — **единственный правильный** способ передать управление init-системе реальной корневой ФС с сохранением семантики PID 1.
 
-1. `chroot` into the new root directory.
-2. Delete all files and directories in the old root (the initramfs) to free RAM.
-3. Use `pivot_root` (or equivalent) to make the new root the actual `/`.
-4. `exec` the new init program.
+---
 
-Example usage (what our script does):
+## Как работает `switch_root`
+
+BusyBox `switch_root` выполняет следующие действия атомарно (с точки зрения новой корневой системы):
+
+1. Выполняет `chroot` в новый корневой каталог.
+2. Удаляет все файлы и каталоги из старой корневой системы (initramfs), освобождая оперативную память.
+3. Использует `pivot_root` (или аналог) для того, чтобы новая корневая ФС стала настоящей `/`.
+4. Выполняет `exec` новой программы init.
+
+Пример использования (то, что делает наш скрипт):
 ```sh
 cd /mnt/root
 exec switch_root . /usr/lib/systemd/systemd
 ```
 
-After this call:
-- The process that was running the initramfs `/init` is replaced by the real init.
-- PID remains 1.
-- The old initramfs memory is released.
+После этого вызова:
+- Процесс, который выполнял `/init` из initramfs, заменяется на реальный init.
+- PID остаётся равным 1.
+- Память старой initramfs освобождается.
 
-If `switch_root` fails, the system usually panics or drops to a rescue shell.
-
----
-
-## Supported Init Systems
-
-- **systemd** (`/usr/lib/systemd/systemd` or `/lib/systemd/systemd`)
-- **OpenRC** (`/sbin/openrc-init` or `/usr/sbin/openrc-init`)
-- **runit** (`/sbin/runit-init` or `/lib/runit/runit-init`)
-- **dinit** (`/sbin/dinit` or `/usr/sbin/dinit`)
-
-The detection script looks in the most common locations used by major distributions (Arch, Debian, Gentoo, Void, Alpine, Artix, etc.).
+Если `switch_root` завершается с ошибкой, система обычно паникует или переходит в rescue-режим.
 
 ---
 
-## Project Structure
+## Поддерживаемые init-системы
+
+- **systemd** (`/usr/lib/systemd/systemd` или `/lib/systemd/systemd`)
+- **OpenRC** (`/sbin/openrc-init` или `/usr/sbin/openrc-init`)
+- **runit** (`/sbin/runit-init` или `/lib/runit/runit-init`)
+- **dinit** (`/sbin/dinit` или `/usr/sbin/dinit`)
+
+Скрипт обнаружения ищет init-системы в наиболее распространённых путях, используемых в популярных дистрибутивах (Arch, Debian, Gentoo, Void, Alpine, Artix и др.).
+
+---
+
+## Структура проекта
 
 ```
 init-selector/
-├── install.sh      # Main installer (run as root)
-├── init            # The actual PID 1 script (runs inside initramfs)
-├── detect.sh       # Helper used by install.sh to find inits
-├── config          # Example / generated configuration
+├── install.sh      # Основной установочный скрипт (запускается от root)
+├── init            # Главный скрипт PID 1 (выполняется внутри initramfs)
+├── detect.sh       # Вспомогательный скрипт для определения установленных init
+├── config          # Пример / генерируемый файл конфигурации
 └── README.md
 ```
 
 ---
 
-## Installation
+## Установка
 
-### Prerequisites
+### Требования
 
-- A Linux system with an initramfs (almost all do).
-- Root access.
-- One or more of the supported init systems installed.
-- One of:
+- Linux-система с initramfs (практически все современные дистрибутивы).
+- Права root.
+- Установлена хотя бы одна из поддерживаемых init-систем.
+- Один из следующих генераторов initramfs:
   - `dracut`
   - `mkinitcpio`
-  - `update-initramfs` (Debian/Ubuntu family)
+  - `update-initramfs` (семейство Debian/Ubuntu)
 
-### Steps
+### Шаги установки
 
-1. Clone or copy the project:
+1. Скопируйте или клонируйте проект:
    ```sh
    git clone ... init-selector
    cd init-selector
    ```
 
-2. Run the installer:
+2. Запустите установщик:
    ```sh
    sudo ./install.sh
    ```
 
-3. The script will:
-   - Detect installed init systems
-   - Generate `/etc/init-selector/config`
-   - Install `/usr/lib/init-selector/init`
-   - Add the appropriate hook/module for your initramfs generator
-   - Attempt to rebuild initramfs images
+3. Скрипт выполнит:
+   - Определение установленных init-систем
+   - Генерацию `/etc/init-selector/config`
+   - Установку `/usr/lib/init-selector/init`
+   - Добавление соответствующего хука/модуля для вашего генератора initramfs
+   - Попытку пересборки образов initramfs
 
-4. Reboot:
+4. Перезагрузите систему:
    ```sh
    sudo reboot
    ```
 
-At boot you should see a menu similar to:
+При загрузке вы увидите меню примерно такого вида:
+
 ```
 ========================================
   init-selector: Choose init system
@@ -140,27 +141,27 @@ Enter number (or name) or wait 5s for default (systemd):
 >
 ```
 
-### Kernel Parameters (bypass menu)
+### Параметры ядра (пропуск меню)
 
-Add to your bootloader kernel command line:
+Добавьте в командную строку ядра в загрузчике:
 
 - `initsel=systemd`
 - `initsel=openrc`
 - `initsel=runit`
 - `initsel=dinit`
 
-Example in GRUB:
+Пример для GRUB:
 ```
 linux /vmlinuz-linux root=/dev/sda2 rw initsel=runit
 ```
 
-When present, the menu is skipped and the chosen init is used immediately.
+При наличии параметра меню не отображается, и сразу используется указанная init-система.
 
 ---
 
-## Configuration
+## Конфигурация
 
-After install, edit `/etc/init-selector/config`:
+После установки отредактируйте файл `/etc/init-selector/config`:
 
 ```sh
 DEFAULT=systemd
@@ -170,65 +171,65 @@ runit /sbin/runit-init
 dinit /sbin/dinit
 ```
 
-- `DEFAULT=` sets the fallback when timeout occurs.
-- The last successfully chosen init is saved to `/etc/init-selector/last` and used as the new default on next boot.
+- `DEFAULT=` — init-система по умолчанию (используется при таймауте).
+- Последний успешно выбранный init сохраняется в файл `/etc/init-selector/last` и становится новым значением по умолчанию при следующей загрузке.
 
-You can also manually create `/etc/init-selector/last` containing just the name (e.g. `openrc`).
-
----
-
-## How It Works at Boot
-
-1. Kernel loads initramfs → executes our `/init` (PID 1).
-2. Our script:
-   - Mounts `/proc`, `/sys`, `/dev`, `/run`
-   - Parses kernel command line (`root=`, `initsel=`)
-   - Mounts the real root filesystem at `/mnt/root`
-   - Loads `/etc/init-selector/config` from real root
-   - Loads last selection if present
-   - If `initsel=` present → use it directly
-   - Else → display interactive menu with 5-second timeout
-   - Validates chosen init exists and is executable on real root
-   - Saves choice to `last`
-   - Calls `switch_root` + `exec` of the chosen init
+Также можно вручную создать файл `/etc/init-selector/last`, содержащий только название init-системы (например, `openrc`).
 
 ---
 
-## Error Handling
+## Как это работает при загрузке
 
-The script handles:
-
-- Missing root filesystem (`root=` parameter or `/dev/root`)
-- Selected init binary not found or not executable
-- `switch_root` failure
-- Invalid `initsel=` value
-- No init systems detected (falls back to safe defaults + rescue shell)
-
-On fatal error it attempts to drop you into an interactive shell on `/dev/console`.
+1. Ядро загружает initramfs → выполняет наш `/init` (PID 1).
+2. Наш скрипт:
+   - Монтирует `/proc`, `/sys`, `/dev`, `/run`
+   - Парсит командную строку ядра (`root=`, `initsel=`)
+   - Монтирует реальную корневую ФС в `/mnt/root`
+   - Загружает `/etc/init-selector/config` из реальной корневой системы
+   - Загружает последний выбор (если есть)
+   - Если указан `initsel=` — использует его сразу
+   - Иначе — показывает интерактивное меню с таймаутом 5 секунд
+   - Проверяет, что выбранный init существует и исполняем
+   - Сохраняет выбор в `last`
+   - Выполняет `switch_root` + `exec` выбранного init
 
 ---
 
-## Removing / Uninstalling
+## Обработка ошибок
 
-### Method 1: Manual (recommended)
+Скрипт корректно обрабатывает следующие ситуации:
+
+- Отсутствует корневая файловая система (`root=` или `/dev/root`)
+- Выбранный бинарник init не найден или не является исполняемым
+- Ошибка выполнения `switch_root`
+- Некорректное значение параметра `initsel=`
+- Ни одна init-система не обнаружена (используются безопасные значения по умолчанию + rescue shell)
+
+При фатальной ошибке скрипт пытается предоставить интерактивную оболочку на `/dev/console`.
+
+---
+
+## Удаление проекта
+
+### Способ 1: Ручное удаление (рекомендуется)
 
 ```sh
-# 1. Remove our files
+# 1. Удаляем наши файлы
 sudo rm -rf /etc/init-selector
 sudo rm -rf /usr/lib/init-selector
 
-# 2. Remove generator-specific integration
-# For dracut:
+# 2. Удаляем интеграцию для генератора initramfs
+# Для dracut:
 sudo rm -rf /usr/lib/dracut/modules.d/99init-selector
 
-# For mkinitcpio:
+# Для mkinitcpio:
 sudo rm -f /etc/initcpio/hooks/init-selector
 sudo rm -f /etc/initcpio/install/init-selector
 
-# For initramfs-tools:
+# Для initramfs-tools:
 sudo rm -f /usr/share/initramfs-tools/hooks/init-selector
 
-# 3. Rebuild initramfs (critical!)
+# 3. Пересобираем initramfs (обязательно!)
 # dracut:
 sudo dracut --force --regenerate-all
 
@@ -239,70 +240,70 @@ sudo mkinitcpio -P
 sudo update-initramfs -u -k all
 ```
 
-### Method 2: Restore original initramfs
+### Способ 2: Восстановление оригинального initramfs
 
-If you have a backup of your previous initramfs image, restore it.
+Если у вас есть резервная копия предыдущего образа initramfs — восстановите её.
 
-### Method 3: Reinstall your initramfs package
+### Способ 3: Переустановка пакета initramfs
 
-On most distros reinstalling the kernel or the initramfs package will regenerate a clean image.
+В большинстве дистрибутивов переустановка пакета ядра или initramfs приведёт к генерации чистого образа.
 
 ---
 
-## Troubleshooting
+## Диагностика и устранение неисправностей
 
-### Menu does not appear
+### Меню не появляется
 
-- Check that the custom `/init` is inside the initramfs:
+- Проверьте, что кастомный `/init` действительно находится внутри initramfs:
   ```sh
   lsinitrd /boot/initramfs-*.img | grep -E '(^/init$|init-selector)'
   ```
-- Try adding `break=init` or `rd.break=init` to kernel cmdline temporarily.
+- Временно добавьте параметр `break=init` или `rd.break=init` в командную строку ядра.
 
-### "No valid init system" error
+### Ошибка «No valid init system»
 
-- Check `/etc/init-selector/config` on the real root.
-- Make sure the paths point to real executables.
-- Run `ls -l /usr/lib/init-selector/init` on the installed system.
+- Проверьте содержимое `/etc/init-selector/config` на реальной корневой системе.
+- Убедитесь, что пути указывают на реальные исполняемые файлы.
+- Проверьте `ls -l /usr/lib/init-selector/init` на установленной системе.
 
-### Selected init does not start
+### Выбранный init не запускается
 
-- The init you chose may require additional setup (e.g. OpenRC may need services enabled).
-- Try booting with `initsel=systemd` first to get a working system.
+- Выбранная init-система может требовать дополнительной настройки (например, для OpenRC нужно включить сервисы).
+- Сначала попробуйте загрузиться с `initsel=systemd`, чтобы получить рабочую систему.
 
-### Want to test without rebooting?
+### Хотите протестировать без перезагрузки?
 
-You can manually test parts of the script, but full testing requires a real boot or a VM with serial console.
-
----
-
-## Design Decisions & Limitations
-
-- **POSIX sh only** — no arrays, no `[[ ]]`, no process substitution.
-- **No external interpreters** — only BusyBox applets + coreutils that are usually present.
-- **No systemd during selection** — the selector runs before any real-root init.
-- **Timeout is 5 seconds** — hardcoded for simplicity (easy to change in `init`).
-- **Assumes one real root** — multi-device setups may require additional `root=` handling.
-- **Does not support nested initramfs** or very exotic boot configurations out of the box.
+Полноценное тестирование возможно только при реальной загрузке или в виртуальной машине с последовательной консолью. Отдельные части скрипта можно тестировать вручную.
 
 ---
 
-## Credits & Inspiration
+## Принятые решения и ограничения
 
-- Bedrock Linux early-boot selection mechanism
-- BusyBox `switch_root` and initramfs documentation
-- Various custom initramfs examples from Gentoo wiki and Arch forums
-- POSIX shell best practices from the Open Group and shellcheck community
-
----
-
-## License
-
-This project is provided as-is for educational and practical use.  
-Feel free to adapt it to your distribution.
-
-**Use at your own risk.** Always keep a known-good kernel/initramfs backup.
+- **Только POSIX sh** — не используются массивы, `[[ ]]`, подстановки процессов.
+- **Без внешних интерпретаторов** — только утилиты BusyBox и базовые команды, которые обычно присутствуют.
+- **systemd не используется во время выбора** — селектор выполняется до запуска любой init-системы реальной корневой ФС.
+- **Таймаут 5 секунд** — жёстко задан для простоты (можно легко изменить в скрипте `init`).
+- **Предполагается одна корневая ФС** — сложные multi-device конфигурации могут потребовать доработки обработки `root=`.
+- **Не поддерживает вложенные initramfs** и очень экзотические схемы загрузки «из коробки».
 
 ---
 
-Happy multi-init booting!
+## Авторство и вдохновение
+
+- Механизм раннего выбора в Bedrock Linux
+- Документация BusyBox по `switch_root` и initramfs
+- Примеры кастомных initramfs из Gentoo Wiki и форумов Arch Linux
+- Лучшие практики написания POSIX-скриптов (Open Group, shellcheck)
+
+---
+
+## Лицензия
+
+Проект предоставляется «как есть» для образовательных и практических целей.  
+Вы можете адаптировать его под свой дистрибутив.
+
+**Используйте на свой страх и риск.** Всегда сохраняйте рабочую копию ядра и initramfs.
+
+---
+
+Удачной загрузки с несколькими init-системами!
