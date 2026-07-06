@@ -288,7 +288,9 @@ compile_init() {
     fi
 
     TMPDIR=$(mktemp -d)
-    cd "$TMPDIR" || die "Не могу создать временную папку"
+    cd "$TMPDIR" || { error "Не могу создать временную папку"; return 1; }
+
+    SUCCESS=0
 
     case "$CHOSEN" in
         dinit)
@@ -296,15 +298,33 @@ compile_init() {
             git clone --depth 1 https://github.com/dinitdev/dinit.git
             cd dinit
             log "Компилируем (может занять 1-3 минуты)..."
-            make -j"$(nproc 2>/dev/null || echo 2)"
-            make install
+            if make -j"$(nproc 2>/dev/null || echo 2)" && make install; then
+                SUCCESS=1
+            fi
             ;;
         runit)
             log "Клонируем репозиторий runit..."
             git clone --depth 1 https://github.com/void-linux/runit.git
             cd runit
-            make
-            make install
+
+            # В репозитории void-linux/runit НЕТ цели make install!
+            # Делаем make, потом вручную копируем бинарники
+            if make; then
+                mkdir -p /usr/local/sbin
+                copied=0
+                for bin in runit runit-init chpst runsv runsvchdir runsvdir sv svlogd; do
+                    if [ -f "$bin" ]; then
+                        cp -f "$bin" /usr/local/sbin/ 2>/dev/null || true
+                        chmod +x /usr/local/sbin/"$bin" 2>/dev/null || true
+                        copied=$((copied + 1))
+                    fi
+                done
+
+                # Реальная проверка
+                if [ -x /usr/local/sbin/runit ] || [ -x /usr/local/sbin/runit-init ]; then
+                    SUCCESS=1
+                fi
+            fi
             ;;
         openrc)
             error "Компиляция OpenRC из исходников очень сложная."
@@ -316,8 +336,26 @@ compile_init() {
     esac
 
     cd /
-    rm -rf "$TMPDIR"
-    log "$CHOSEN успешно скомпилирован и установлен."
+    rm -rf "$TMPDIR" 2>/dev/null || true
+
+    # === СТРОГАЯ ПРОВЕРКА РЕЗУЛЬТАТА ===
+    case "$CHOSEN" in
+        runit)
+            if [ -x /usr/local/sbin/runit ] || [ -x /usr/sbin/runit ] || [ -x /sbin/runit ] || [ -x /usr/local/sbin/runit-init ]; then
+                log "$CHOSEN успешно скомпилирован и установлен."
+                return 0
+            fi
+            ;;
+        dinit)
+            if [ -x /usr/local/sbin/dinit ] || [ -x /usr/sbin/dinit ] || [ -x /sbin/dinit ]; then
+                log "$CHOSEN успешно скомпилирован и установлен."
+                return 0
+            fi
+            ;;
+    esac
+
+    error "Компиляция $CHOSEN завершилась неудачно или бинарник не появился в системе."
+    return 1
 }
 
 # === Запуск установки ===
@@ -331,13 +369,49 @@ esac
 
 echo
 
+INSTALL_SUCCESS=0
+
 if [ "$NEED_COMPILE" = "1" ]; then
-    compile_init || die "Не удалось скомпилировать $CHOSEN"
-else
-    if ! install_with_pkg 2>/dev/null; then
-        warn "Не удалось установить через пакеты. Пробуем скомпилировать..."
-        compile_init || die "Установка провалилась"
+    if compile_init; then
+        INSTALL_SUCCESS=1
     fi
+else
+    if install_with_pkg 2>/dev/null; then
+        INSTALL_SUCCESS=1
+    else
+        warn "Не удалось установить через пакеты. Пробуем скомпилировать..."
+        if compile_init; then
+            INSTALL_SUCCESS=1
+        fi
+    fi
+fi
+
+# === СТРОГАЯ ФИНАЛЬНАЯ ПРОВЕРКА ===
+FINAL_CHECK=0
+
+case "$CHOSEN" in
+    runit)
+        if [ -x /usr/local/sbin/runit ] || [ -x /usr/sbin/runit ] || [ -x /sbin/runit ] || \
+           [ -x /usr/local/sbin/runit-init ] || [ -x /sbin/runit-init ]; then
+            FINAL_CHECK=1
+        fi
+        ;;
+    dinit)
+        if [ -x /usr/local/sbin/dinit ] || [ -x /usr/sbin/dinit ] || [ -x /sbin/dinit ]; then
+            FINAL_CHECK=1
+        fi
+        ;;
+    openrc)
+        if [ -x /sbin/openrc-init ] || [ -x /usr/sbin/openrc-init ] || [ -x /usr/bin/openrc-init ]; then
+            FINAL_CHECK=1
+        fi
+        ;;
+esac
+
+if [ "$INSTALL_SUCCESS" != "1" ] || [ "$FINAL_CHECK" != "1" ]; then
+    error "Установка $CHOSEN завершилась с ошибкой."
+    error "Бинарник не был найден в ожидаемых местах."
+    exit 1
 fi
 
 # ==========================================
