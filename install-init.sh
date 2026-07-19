@@ -205,10 +205,15 @@ echo
 # ==========================================
 pkg_names_for_init() {
     case "$PKG_MANAGER:$1" in
-        apt:openrc)    echo "openrc openrc-init" ;;
-        apt:runit)     echo "runit runit-init" ;;
+        # Do not install Debian's *-init replacement packages here.  Packages
+        # such as runit-init, openrc-init and sysvinit-core own /sbin/init and
+        # conflict with the distribution's selected init package.  The selector
+        # starts the regular runit/OpenRC binary directly, so those packages are
+        # neither needed nor safe for an additive installation.
+        apt:openrc)    echo "openrc" ;;
+        apt:runit)     echo "runit" ;;
         apt:dinit)     echo "dinit" ;;
-        apt:sysvinit)  echo "sysvinit-core sysvinit-utils" ;;
+        apt:sysvinit)  echo "sysvinit-utils" ;;
         apt:s6)        echo "s6 s6-rc s6-linux-init" ;;
         apt:shepherd)  echo "shepherd" ;;
         apt:finit)     echo "finit" ;;
@@ -327,20 +332,26 @@ compile_from_source() {
             if make; then
                 mkdir -p /usr/local/sbin
                 copied=0
+                # Do not search the source tree by filename: runit trees often
+                # contain executable service/stage scripts named like helpers.
+                # Only install files from the build output directories.
                 for bin in runit runit-init chpst runsv runsvchdir runsvdir sv svlogd; do
                     src=""
-                    if [ -f "$bin" ]; then
-                        src="$bin"
-                    else
-                        src=$(find . -type f -name "$bin" -perm -111 2>/dev/null | sed -n '1p')
-                    fi
-                    if [ -n "$src" ] && [ -f "$src" ]; then
+                    for candidate in "./$bin" "./src/$bin" "./command/$bin"; do
+                        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+                            src=$candidate
+                            break
+                        fi
+                    done
+                    if [ -n "$src" ]; then
                         cp -f "$src" /usr/local/sbin/"$bin"
                         chmod 755 /usr/local/sbin/"$bin"
                         copied=$((copied + 1))
                     fi
                 done
-                [ "$copied" -gt 0 ] && SUCCESS=1
+                # A usable runit installation must include the actual runit
+                # executable, not merely a stage/service shell script.
+                [ -x /usr/local/sbin/runit ] && SUCCESS=1
             fi
             ;;
         sinit)
@@ -383,7 +394,9 @@ find_init_path() {
             paths="/sbin/openrc-init /usr/sbin/openrc-init /usr/bin/openrc-init"
             ;;
         runit)
-            paths="/sbin/runit-init /usr/sbin/runit-init /usr/bin/runit-init /usr/local/sbin/runit-init /lib/runit/runit-init /sbin/runit /usr/sbin/runit /usr/bin/runit /usr/local/sbin/runit"
+            # Prefer the runit executable.  Debian's runit-init package is an
+            # init replacement and is intentionally not installed by this tool.
+            paths="/sbin/runit /usr/sbin/runit /usr/bin/runit /usr/local/sbin/runit /lib/runit/runit /lib/runit/runit-init /sbin/runit-init /usr/sbin/runit-init /usr/bin/runit-init /usr/local/sbin/runit-init"
             ;;
         dinit)
             paths="/sbin/dinit /usr/sbin/dinit /usr/bin/dinit /usr/local/sbin/dinit /usr/local/bin/dinit"
@@ -451,6 +464,9 @@ post_install_notes() {
             ;;
         runit)
             warn "runit требует stage-скрипты и каталог сервисов для полноценной загрузки."
+            if [ "$PKG_MANAGER" = "apt" ]; then
+                warn "На Debian/Ubuntu намеренно не устанавливается runit-init: он заменяет /sbin/init и конфликтует с системным init-пакетом."
+            fi
             ;;
         dinit)
             warn "dinit требует каталог описаний сервисов и boot service."

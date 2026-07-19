@@ -69,22 +69,25 @@ detect_inits() {
     found=""
 
     # Native init binaries.  Avoid generic /sbin/init here because it is often
-    # a symlink to another init and needs special classification below.
+    # a symlink to another init and needs special classification below. Prefer
+    # runit's regular binary; Debian's runit-init is only a fallback because it
+    # is supplied by an optional init-replacement package.
     candidates="
 systemd:/usr/lib/systemd/systemd
 systemd:/lib/systemd/systemd
 openrc:/sbin/openrc-init
 openrc:/usr/sbin/openrc-init
 openrc:/usr/bin/openrc-init
-runit:/sbin/runit-init
-runit:/usr/sbin/runit-init
-runit:/usr/bin/runit-init
-runit:/usr/local/sbin/runit-init
-runit:/lib/runit/runit-init
 runit:/sbin/runit
 runit:/usr/sbin/runit
 runit:/usr/bin/runit
 runit:/usr/local/sbin/runit
+runit:/lib/runit/runit
+runit:/lib/runit/runit-init
+runit:/sbin/runit-init
+runit:/usr/sbin/runit-init
+runit:/usr/bin/runit-init
+runit:/usr/local/sbin/runit-init
 dinit:/sbin/dinit
 dinit:/usr/sbin/dinit
 dinit:/usr/bin/dinit

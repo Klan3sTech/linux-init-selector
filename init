@@ -211,15 +211,16 @@ load_config() {
             "openrc:/sbin/openrc-init" \
             "openrc:/usr/sbin/openrc-init" \
             "openrc:/usr/bin/openrc-init" \
-            "runit:/sbin/runit-init" \
-            "runit:/usr/sbin/runit-init" \
-            "runit:/usr/bin/runit-init" \
-            "runit:/usr/local/sbin/runit-init" \
-            "runit:/lib/runit/runit-init" \
             "runit:/sbin/runit" \
             "runit:/usr/sbin/runit" \
             "runit:/usr/bin/runit" \
             "runit:/usr/local/sbin/runit" \
+            "runit:/lib/runit/runit" \
+            "runit:/lib/runit/runit-init" \
+            "runit:/sbin/runit-init" \
+            "runit:/usr/sbin/runit-init" \
+            "runit:/usr/bin/runit-init" \
+            "runit:/usr/local/sbin/runit-init" \
             "dinit:/sbin/dinit" \
             "dinit:/usr/sbin/dinit" \
             "dinit:/usr/bin/dinit" \
@@ -376,17 +377,22 @@ validate_init() {
 # Uses read with -t for timeout.
 # Returns chosen name (empty on timeout)
 show_menu() {
-    # If no inits, error
+    # Command substitution captures stdout below, so all menu UI must go to
+    # stderr (the initramfs console).  Keep stdout exclusively for the chosen
+    # name; otherwise the menu silently disappears and validation receives the
+    # whole rendered menu instead of an init name.
+    menu_print() { printf '%s\n' "$*" >&2; }
+
     if [ -z "$INITS_LIST" ]; then
         fatal "No init systems detected in configuration"
     fi
 
-    echo ""
-    echo "========================================"
-    echo "  init-selector: Choose init system"
-    echo "========================================"
-    echo ""
-    echo "Available init systems:"
+    menu_print ""
+    menu_print "========================================"
+    menu_print "  init-selector: Choose init system"
+    menu_print "========================================"
+    menu_print ""
+    menu_print "Available init systems:"
     i=1
     for entry in $INITS_LIST; do
         n=${entry%%:*}
@@ -395,28 +401,23 @@ show_menu() {
         if [ "$n" = "$DEFAULT_INIT" ]; then
             marker=" (default)"
         fi
-        echo "  $i) $n - $p$marker"
+        menu_print "  $i) $n - $p$marker"
         eval "MENU_$i=$n"
         i=$((i + 1))
     done
-    echo ""
-    echo "Enter number (or name) or wait ${TIMEOUT}s for default ($DEFAULT_INIT):"
-    echo -n "> "
+    menu_print ""
+    menu_print "Enter number (or name) or wait ${TIMEOUT}s for default ($DEFAULT_INIT):"
+    printf '> ' >&2
 
-    # Read with timeout using read -t (POSIX sh compliant in BusyBox/ash)
     choice=""
     if read -t "$TIMEOUT" choice < /dev/console 2>/dev/null || \
        read -t "$TIMEOUT" choice; then
-        # success
         :
     else
-        # timeout
         choice=""
     fi
 
-    echo ""
-
-    # Normalize choice
+    menu_print ""
     choice=$(echo "$choice" | tr -d ' \t\r\n' | tr '[:upper:]' '[:lower:]')
 
     if [ -z "$choice" ]; then
@@ -424,7 +425,6 @@ show_menu() {
         return 0
     fi
 
-    # If numeric
     case "$choice" in
         [0-9]*)
             num=$choice
@@ -438,7 +438,6 @@ show_menu() {
             ;;
     esac
 
-    # Try as direct name
     for entry in $INITS_LIST; do
         n=${entry%%:*}
         if [ "$n" = "$choice" ]; then
@@ -447,11 +446,9 @@ show_menu() {
         fi
     done
 
-    # Invalid -> default
     log "Invalid choice '$choice', using default"
     echo "$DEFAULT_INIT"
 }
-
 # perform_switch_root - Do the switch.
 # cd to newroot, exec switch_root . /path/to/init
 # Must be last thing executed.

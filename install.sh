@@ -224,17 +224,15 @@ install() {
     # Install our custom init as the init script (overrides default)
     inst_simple /usr/lib/init-selector/init /init
 
-    # Also copy the config and last file so they are available in initramfs
-    # (we will read from real root anyway, but having them early is safe)
+    # Keep a copy in the image as a diagnostic/fallback.  The authoritative
+    # configuration is read from the mounted real root by /init.
     inst_dir /etc/init-selector
     inst_simple /etc/init-selector/config /etc/init-selector/config
     [ -f /etc/init-selector/last ] && inst_simple /etc/init-selector/last /etc/init-selector/last
 
-    # Ensure switch_root is available (dracut usually includes it)
-    inst_binary switch_root || true
-
-    # Mark as critical so dracut includes it
-    inst_hook cmdline 99 "$moddir/init-selector.sh" || true
+    # The selector is a shell PID 1 and needs these commands even in a minimal
+    # dracut image.  inst_binary also pulls shared-library dependencies.
+    inst_multiple mount umount switch_root readlink tr dirname || return 1
 }
 
 DRACUTSETUP
@@ -286,38 +284,42 @@ help() {
 MKINSTALL
     chmod 755 "${INSTALL_DIR}/init-selector"
 
-    # runtime hook (runs inside initramfs before /init is executed)
-    # We do not need much because our /init is the selector.
-    cat > "${HOOKS_DIR}/init-selector" << 'MKHOOK'
-#!/bin/sh
+    # A runtime hook is not required: /init is the selector itself.
+    rm -f "${HOOKS_DIR}/init-selector"
 
-run_hook() {
-    # The custom /init is already in place.
-    # We could add early messages here if wanted.
-    echo "init-selector: mkinitcpio hook executed"
-}
-MKHOOK
-    chmod 755 "${HOOKS_DIR}/init-selector"
+    # mkinitcpio only runs install hooks listed in HOOKS.  Add ours at the end
+    # so that add_file(..., /init) wins over the base hook deterministically.
+    MKINITCPIO_CONF=/etc/mkinitcpio.conf
+    if [ -f "$MKINITCPIO_CONF" ]; then
+        if grep -Eq '^[[:space:]]*HOOKS=.*init-selector' "$MKINITCPIO_CONF"; then
+            log "init-selector is already present in mkinitcpio HOOKS."
+        else
+            tmp="${MKINITCPIO_CONF}.init-selector.$$"
+            sed '/^[[:space:]]*HOOKS=/ s/)$/ init-selector)/' "$MKINITCPIO_CONF" > "$tmp"
+            if cmp -s "$MKINITCPIO_CONF" "$tmp"; then
+                rm -f "$tmp"
+                warn "Could not find a simple HOOKS=(...) line in $MKINITCPIO_CONF."
+                warn "Add init-selector as the final entry in HOOKS before rebuilding."
+            else
+                mv "$tmp" "$MKINITCPIO_CONF"
+                log "Added init-selector to mkinitcpio HOOKS."
+            fi
+        fi
+    else
+        warn "$MKINITCPIO_CONF does not exist; add init-selector to HOOKS manually."
+    fi
 
-    log "mkinitcpio hooks installed."
-
-    # Advice to user
-    warn "IMPORTANT: Add 'init-selector' to the HOOKS array in /etc/mkinitcpio.conf"
-    warn "Example: HOOKS=(base udev autodetect modconf block filesystems fsck init-selector)"
-    warn "Then run mkinitcpio -P manually if automatic rebuild fails."
+    log "mkinitcpio install hook installed."
 }
 
 install_initramfs_tools() {
     log "Installing for update-initramfs (initramfs-tools)..."
 
-    SCRIPTS_DIR="/usr/share/initramfs-tools/scripts"
     HOOKS_DIR="/usr/share/initramfs-tools/hooks"
+    mkdir -p "$HOOKS_DIR"
 
-    mkdir -p "$SCRIPTS_DIR/initramfs-tools" "$HOOKS_DIR"
-
-    # We use a bottom script that overrides /init at the end
-    # initramfs-tools runs scripts in order: init, local, etc.
-    # Best: use a hook to copy our script over /init
+    # Hooks run while the image is assembled.  Installing /init from here is
+    # the supported way to replace initramfs-tools' generated entry point.
 
     cat > "${HOOKS_DIR}/init-selector" << 'IFHOOK'
 #!/bin/sh
@@ -335,10 +337,17 @@ esac
 
 . /usr/share/initramfs-tools/hook-functions
 
-# Copy the selector init
-if [ -f /usr/lib/init-selector/init ]; then
-    copy_exec /usr/lib/init-selector/init /init
-fi
+# Install the selector as the image entry point.  copy_exec is used instead
+# of cp so that an interpreter and any required libraries are included too.
+[ -x /usr/lib/init-selector/init ] || exit 0
+copy_exec /usr/lib/init-selector/init /init
+
+# Explicitly include commands used by the selector.  Minimal initramfs-tools
+# configurations do not necessarily pull all of them in through the stock init.
+for command in mount umount switch_root readlink tr dirname; do
+    path=$(command -v "$command" 2>/dev/null || true)
+    [ -n "$path" ] && copy_exec "$path"
+done
 
 # Copy config
 if [ -d /etc/init-selector ]; then
