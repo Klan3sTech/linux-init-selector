@@ -188,6 +188,15 @@ if command -v dracut >/dev/null 2>&1 && [ -d /usr/lib/dracut ]; then
 elif command -v mkinitcpio >/dev/null 2>&1; then
     DETECTED_GENERATOR="mkinitcpio"
 elif command -v update-initramfs >/dev/null 2>&1; then
+    UPDATE_INITRAMFS=$(command -v update-initramfs)
+    DETECTED_GENERATOR="update-initramfs"
+elif [ -x /usr/sbin/update-initramfs ]; then
+    # Root sessions launched through su/sudo may have a restricted PATH that
+    # omits /usr/sbin even though initramfs-tools is installed.
+    UPDATE_INITRAMFS=/usr/sbin/update-initramfs
+    DETECTED_GENERATOR="update-initramfs"
+elif [ -x /sbin/update-initramfs ]; then
+    UPDATE_INITRAMFS=/sbin/update-initramfs
     DETECTED_GENERATOR="update-initramfs"
 else
     warn "No supported initramfs generator found (dracut/mkinitcpio/update-initramfs)."
@@ -426,9 +435,9 @@ case "$DETECTED_GENERATOR" in
         ;;
 
     update-initramfs)
-        if command -v update-initramfs >/dev/null; then
+        if [ -n "${UPDATE_INITRAMFS:-}" ] && [ -x "$UPDATE_INITRAMFS" ]; then
             log "Running update-initramfs -u -k all"
-            if update-initramfs -u -k all 2>&1; then
+            if "$UPDATE_INITRAMFS" -u -k all 2>&1; then
                 rebuild_success=1
                 log "update-initramfs completed"
             else
