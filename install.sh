@@ -27,7 +27,7 @@ INIT_SCRIPT_SRC="${PROJECT_DIR}/init"
 INIT_SCRIPT_DST="${LIBDIR}/init"
 DETECT_SCRIPT="${PROJECT_DIR}/detect.sh"
 
-SUPPORTED_INITS="systemd openrc runit dinit"
+SUPPORTED_INITS="systemd openrc runit dinit sysvinit s6 shepherd finit sinit epoch busybox-init"
 
 # Colors for output (optional, but nice; fall back gracefully)
 if [ -t 1 ]; then
@@ -67,8 +67,8 @@ fi
 # --- 1. Detect installed init systems ---
 log "Detecting installed init systems..."
 
-if [ ! -x "$DETECT_SCRIPT" ]; then
-    die "detect.sh not found or not executable in $PROJECT_DIR"
+if [ ! -f "$DETECT_SCRIPT" ]; then
+    die "detect.sh not found in $PROJECT_DIR"
 fi
 
 # Capture output of detect.sh
@@ -109,7 +109,7 @@ cat > "$CONFIG_FILE" << 'EOF'
 #   DEFAULT=<name>
 #   <name> <full-path-on-root>
 #
-# Supported names: systemd, openrc, runit, dinit
+# Supported names: systemd, openrc, runit, dinit, sysvinit, s6, shepherd, finit, sinit, epoch, busybox-init
 #
 # The last chosen init is saved in last file and overrides DEFAULT.
 #
@@ -446,6 +446,9 @@ echo "  4. At boot you should see the init-selector menu (unless initsel= param 
 echo ""
 echo "Kernel parameters supported:"
 echo "  initsel=systemd   initsel=openrc   initsel=runit   initsel=dinit"
+echo "  initsel=sysvinit  initsel=s6       initsel=shepherd"
+echo "  initsel=finit     initsel=sinit    initsel=epoch"
+echo "  initsel=busybox-init"
 echo ""
 echo "To remove later, see README.md or run the uninstall steps."
 echo ""
