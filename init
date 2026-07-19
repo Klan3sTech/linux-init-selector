@@ -25,7 +25,7 @@ LAST_FILE=${CONFIG_DIR}/last
 TIMEOUT=5
 
 # Supported init names (hardcoded for safety)
-SUPPORTED="systemd openrc runit dinit"
+SUPPORTED="systemd openrc runit dinit sysvinit s6 shepherd finit sinit epoch busybox-init"
 
 # --- Helper functions with comments ---
 
@@ -140,6 +140,28 @@ mount_root() {
     log "Root mounted successfully at $REAL_ROOT_MOUNT"
 }
 
+# add_init_entry - Append an init entry to INITS_LIST if it exists and this
+# init name was not added yet. Used by fallback detection in initramfs.
+add_init_entry() {
+    name="$1"
+    p="$2"
+
+    [ -x "${REAL_ROOT_MOUNT}${p}" ] || return 1
+
+    for entry in $INITS_LIST; do
+        n=${entry%%:*}
+        if [ "$n" = "$name" ]; then
+            return 0
+        fi
+    done
+
+    if [ -z "$INITS_LIST" ]; then
+        INITS_LIST="${name}:${p}"
+    else
+        INITS_LIST="${INITS_LIST} ${name}:${p}"
+    fi
+}
+
 # load_config - Load init list from real root's config.
 # Expects $REAL_ROOT_MOUNT$CONFIG_FILE
 # Populates global variables:
@@ -187,16 +209,63 @@ load_config() {
             "systemd:/usr/lib/systemd/systemd" \
             "systemd:/lib/systemd/systemd" \
             "openrc:/sbin/openrc-init" \
+            "openrc:/usr/sbin/openrc-init" \
+            "openrc:/usr/bin/openrc-init" \
             "runit:/sbin/runit-init" \
-            "dinit:/sbin/dinit"; do
+            "runit:/usr/sbin/runit-init" \
+            "runit:/usr/bin/runit-init" \
+            "runit:/usr/local/sbin/runit-init" \
+            "runit:/lib/runit/runit-init" \
+            "runit:/sbin/runit" \
+            "runit:/usr/sbin/runit" \
+            "runit:/usr/bin/runit" \
+            "runit:/usr/local/sbin/runit" \
+            "dinit:/sbin/dinit" \
+            "dinit:/usr/sbin/dinit" \
+            "dinit:/usr/bin/dinit" \
+            "dinit:/usr/local/sbin/dinit" \
+            "dinit:/usr/local/bin/dinit" \
+            "s6:/etc/s6-linux-init/current/bin/init" \
+            "s6:/sbin/s6-linux-init" \
+            "s6:/usr/sbin/s6-linux-init" \
+            "s6:/usr/local/sbin/s6-linux-init" \
+            "shepherd:/usr/bin/shepherd" \
+            "shepherd:/bin/shepherd" \
+            "shepherd:/usr/sbin/shepherd" \
+            "shepherd:/usr/local/bin/shepherd" \
+            "finit:/sbin/finit" \
+            "finit:/usr/sbin/finit" \
+            "finit:/usr/local/sbin/finit" \
+            "sinit:/sbin/sinit" \
+            "sinit:/usr/sbin/sinit" \
+            "sinit:/usr/local/sbin/sinit" \
+            "epoch:/sbin/epoch" \
+            "epoch:/usr/sbin/epoch" \
+            "epoch:/usr/local/sbin/epoch"; do
             name=${pair%%:*}
             p=${pair#*:}
-            if [ -x "${REAL_ROOT_MOUNT}${p}" ]; then
-                if [ -z "$INITS_LIST" ]; then
-                    INITS_LIST="${name}:${p}"
-                else
-                    INITS_LIST="${INITS_LIST} ${name}:${p}"
-                fi
+            add_init_entry "$name" "$p"
+        done
+
+        # Classify generic /sbin/init-like paths carefully.  This avoids
+        # offering sysvinit on a systemd root where /sbin/init is only a
+        # systemd symlink.
+        for generic_init in /sbin/init /usr/sbin/init /bin/init; do
+            [ -x "${REAL_ROOT_MOUNT}${generic_init}" ] || continue
+            target=""
+            if command -v readlink >/dev/null 2>&1; then
+                target=$(readlink -f "${REAL_ROOT_MOUNT}${generic_init}" 2>/dev/null || readlink "${REAL_ROOT_MOUNT}${generic_init}" 2>/dev/null || true)
+            fi
+
+            case "$target" in
+                *systemd*) add_init_entry systemd "$generic_init"; continue ;;
+                *busybox*|*BusyBox*) add_init_entry busybox-init "$generic_init"; continue ;;
+            esac
+
+            if [ -f "${REAL_ROOT_MOUNT}/etc/inittab" ]; then
+                case "$generic_init" in
+                    /sbin/init|/usr/sbin/init) add_init_entry sysvinit "$generic_init" ;;
+                esac
             fi
         done
     fi
@@ -277,6 +346,29 @@ validate_init() {
     if [ ! -x "$full" ]; then
         return 1
     fi
+
+    # Generic /sbin/init style paths need extra checks; otherwise a manually
+    # written config could label systemd's /sbin/init as sysvinit or BusyBox.
+    target=""
+    if command -v readlink >/dev/null 2>&1; then
+        target=$(readlink -f "$full" 2>/dev/null || readlink "$full" 2>/dev/null || true)
+    fi
+
+    case "$name" in
+        sysvinit)
+            [ -f "${REAL_ROOT_MOUNT}/etc/inittab" ] || return 1
+            case "$target" in
+                *systemd*|*busybox*|*BusyBox*) return 1 ;;
+            esac
+            ;;
+        busybox-init)
+            case "$target" in
+                *busybox*|*BusyBox*) ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+
     return 0
 }
 
@@ -365,6 +457,7 @@ show_menu() {
 # Must be last thing executed.
 perform_switch_root() {
     name="$1"
+    shift
     init_path=$(get_init_path "$name")
     if [ -z "$init_path" ]; then
         fatal "Internal error: no path for $name"
@@ -415,12 +508,15 @@ handle_kernel_param() {
     # Normalize
     sel=$(echo "$INITS_EL" | tr '[:upper:]' '[:lower:]')
 
-    # Map common aliases
+    # Map common aliases and validate the requested name.
     case "$sel" in
-        systemd|systemd) sel="systemd" ;;
-        openrc|openrc)   sel="openrc" ;;
-        runit|runit)     sel="runit" ;;
-        dinit|dinit)     sel="dinit" ;;
+        sysv|sysvinit|sysv-init) sel="sysvinit" ;;
+        busybox|busyboxinit|busybox-init) sel="busybox-init" ;;
+        gnu-shepherd|gnu_shepherd) sel="shepherd" ;;
+    esac
+
+    case " $SUPPORTED " in
+        *" $sel "*) ;;
         *)
             log "Invalid initsel='$INITS_EL' (must be one of: $SUPPORTED)"
             return 1

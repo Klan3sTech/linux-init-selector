@@ -66,12 +66,26 @@ exec switch_root . /usr/lib/systemd/systemd
 
 ## Поддерживаемые init-системы
 
-- **systemd** (`/usr/lib/systemd/systemd` или `/lib/systemd/systemd`)
-- **OpenRC** (`/sbin/openrc-init` или `/usr/sbin/openrc-init`)
-- **runit** (`/sbin/runit-init` или `/lib/runit/runit-init`)
-- **dinit** (`/sbin/dinit` или `/usr/sbin/dinit`)
+Базово поддерживаются и автоматически обнаруживаются:
 
-Скрипт обнаружения ищет init-системы в наиболее распространённых путях, используемых в популярных дистрибутивах (Arch, Debian, Gentoo, Void, Alpine, Artix и др.).
+- **systemd** (`/usr/lib/systemd/systemd` или `/lib/systemd/systemd`)
+- **OpenRC** (`/sbin/openrc-init`, `/usr/sbin/openrc-init`, `/usr/bin/openrc-init`)
+- **runit** (`/sbin/runit-init`, `/usr/sbin/runit-init`, `/usr/bin/runit-init`, `/lib/runit/runit-init`, `/usr/local/sbin/runit-init`)
+- **dinit** (`/sbin/dinit`, `/usr/sbin/dinit`, `/usr/bin/dinit`, `/usr/local/sbin/dinit`, `/usr/local/bin/dinit`)
+
+Дополнительно добавлена поддержка более редких init-систем:
+
+- **SysVinit** (`/sbin/init` или `/usr/sbin/init`, если это не symlink на systemd)
+- **s6-linux-init** (`/etc/s6-linux-init/current/bin/init`, `/sbin/s6-linux-init`, `/usr/sbin/s6-linux-init`)
+- **GNU Shepherd** (`/usr/bin/shepherd`, `/bin/shepherd`, `/usr/sbin/shepherd`, `/usr/local/bin/shepherd`)
+- **Finit** (`/sbin/finit`, `/usr/sbin/finit`, `/usr/local/sbin/finit`)
+- **sinit** (`/sbin/sinit`, `/usr/sbin/sinit`, `/usr/local/sbin/sinit`)
+- **Epoch** (`/sbin/epoch`, `/usr/sbin/epoch`, `/usr/local/sbin/epoch`)
+- **BusyBox init** (`/sbin/init`, если это symlink на BusyBox)
+
+Скрипт обнаружения ищет init-системы в наиболее распространённых путях, используемых в популярных дистрибутивах (Arch, Debian, Gentoo, Void, Alpine, Artix и др.). Для `/sbin/init` используется осторожная классификация, чтобы не принять systemd за SysVinit.
+
+**Важно:** установка бинарника init-системы ещё не означает, что система готова загрузиться под ней. OpenRC, runit, dinit, s6, Shepherd, Finit и другие init-системы требуют собственных описаний сервисов, getty, shutdown/reboot-логики и сетевых сервисов.
 
 ---
 
@@ -79,10 +93,11 @@ exec switch_root . /usr/lib/systemd/systemd
 
 ```
 init-selector/
-├── install.sh      # Основной установочный скрипт (запускается от root)
-├── init            # Главный скрипт PID 1 (выполняется внутри initramfs)
-├── detect.sh       # Вспомогательный скрипт для определения установленных init
-├── config          # Пример / генерируемый файл конфигурации
+├── install.sh       # Основной установочный скрипт (запускается от root)
+├── install-init.sh  # Помощник установки альтернативных init-систем
+├── init             # Главный скрипт PID 1 (выполняется внутри initramfs)
+├── detect.sh        # Вспомогательный скрипт для определения установленных init
+├── config           # Пример / генерируемый файл конфигурации
 └── README.md
 ```
 
@@ -108,19 +123,26 @@ init-selector/
    cd init-selector
    ```
 
-2. Запустите установщик:
+2. При необходимости сначала установите альтернативную init-систему:
+   ```sh
+   sudo ./install-init.sh
+   ```
+
+   Этот помощник умеет ставить через пакетный менеджер или собирать из исходников некоторые init-системы (`runit`, `dinit`, `sinit`). После установки всё равно нужно настроить сервисы выбранной init-системы.
+
+3. Запустите установщик init-selector:
    ```sh
    sudo ./install.sh
    ```
 
-3. Скрипт выполнит:
+4. Скрипт выполнит:
    - Определение установленных init-систем
    - Генерацию `/etc/init-selector/config`
    - Установку `/usr/lib/init-selector/init`
    - Добавление соответствующего хука/модуля для вашего генератора initramfs
    - Попытку пересборки образов initramfs
 
-4. Перезагрузите систему:
+5. Перезагрузите систему:
    ```sh
    sudo reboot
    ```
@@ -149,6 +171,13 @@ Enter number (or name) or wait 5s for default (systemd):
 - `initsel=openrc`
 - `initsel=runit`
 - `initsel=dinit`
+- `initsel=sysvinit`
+- `initsel=s6`
+- `initsel=shepherd`
+- `initsel=finit`
+- `initsel=sinit`
+- `initsel=epoch`
+- `initsel=busybox-init`
 
 Пример для GRUB:
 ```
@@ -169,6 +198,13 @@ systemd /usr/lib/systemd/systemd
 openrc /sbin/openrc-init
 runit /sbin/runit-init
 dinit /sbin/dinit
+# sysvinit /sbin/init
+# s6 /etc/s6-linux-init/current/bin/init
+# shepherd /usr/bin/shepherd
+# finit /sbin/finit
+# sinit /sbin/sinit
+# epoch /sbin/epoch
+# busybox-init /sbin/init
 ```
 
 - `DEFAULT=` — init-система по умолчанию (используется при таймауте).
@@ -284,6 +320,8 @@ sudo update-initramfs -u -k all
 - **systemd не используется во время выбора** — селектор выполняется до запуска любой init-системы реальной корневой ФС.
 - **Таймаут 5 секунд** — жёстко задан для простоты (можно легко изменить в скрипте `init`).
 - **Предполагается одна корневая ФС** — сложные multi-device конфигурации могут потребовать доработки обработки `root=`.
+- **Альтернативные init-системы требуют собственной настройки сервисов** — установка пакета не создаёт автоматически рабочие runlevel/service directories.
+- **s6-linux-init требует сгенерированного init-дерева** — обычно это `/etc/s6-linux-init/current/bin/init`.
 - **Не поддерживает вложенные initramfs** и очень экзотические схемы загрузки «из коробки».
 
 ---
